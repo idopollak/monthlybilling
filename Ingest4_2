@@ -1,0 +1,462 @@
+/**
+ * Perform additional processing after importing an XLS file
+ * This includes:
+ * 1. Duplicating the (RAW) sheet to create a (STG1) sheet
+ * 2. Trimming whitespace from column A
+ * 3. Performing name substitution for values in column A
+ * 4. Inserting a new column for entity types
+ * 5. Processing entity types
+ * 6. Updating Main Ingest sheet with completion status
+ */
+function performAdditionalProcessing() {
+  const CustomLogger = {
+    logs: [],
+    add: function(message) {
+      this.logs.push(new Date().toISOString() + ": " + message);
+      console.log(message);
+    },
+    getLogs: function() {
+      return this.logs.join("\n");
+    }
+  };
+  
+  try {
+    CustomLogger.add("Starting additional processing stages");
+    
+    // Get active spreadsheet and the current raw sheet
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const currentSheet = ss.getActiveSheet();
+    
+    CustomLogger.add("Working with sheet: " + currentSheet.getName());
+    
+    // Extract month identifier from sheet name (assuming format like "Feb-25 (RAW)")
+    let currentMonth = "";
+    const sheetNameMatch = currentSheet.getName().match(/(.+?)\s*\(RAW\)/i);
+    if (sheetNameMatch && sheetNameMatch[1]) {
+      currentMonth = sheetNameMatch[1].trim();
+      CustomLogger.add("Detected month: " + currentMonth);
+    } else {
+      CustomLogger.add("WARNING: Could not detect month from sheet name: " + currentSheet.getName());
+      SpreadsheetApp.getUi().alert(
+        'Warning',
+        'Expected sheet name format "[Month-YY] (RAW)". Please ensure you are using the correct sheet.',
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+      return;
+    }
+    
+    // Step 1: Create or activate STG1 sheet by duplicating RAW sheet
+    const stg1SheetName = currentMonth + " (STG1)";
+    CustomLogger.add("Checking for existing STG1 sheet: " + stg1SheetName);
+    
+    // Check if STG1 sheet already exists
+    let stg1Sheet = ss.getSheetByName(stg1SheetName);
+    
+    if (stg1Sheet) {
+      CustomLogger.add("STG1 sheet already exists, activating it");
+      stg1Sheet.activate();
+    } else {
+      // Duplicate RAW sheet and rename it to STG1
+      CustomLogger.add("Duplicating RAW sheet to create STG1");
+      stg1Sheet = currentSheet.copyTo(ss);
+      stg1Sheet.setName(stg1SheetName);
+      stg1Sheet.activate();
+      CustomLogger.add("Created and activated new STG1 sheet");
+    }
+    
+    // Step 2: Trim whitespace from column A
+    trimWhitespaceColumnA(stg1Sheet, CustomLogger);
+    
+    // Step 3: Perform name substitution
+    performNameSubstitution(stg1Sheet, CustomLogger);
+    
+    // Step 4: Insert column before column A (for entity types)
+    insertEntityTypeColumn(stg1Sheet, CustomLogger);
+    
+    // Step 5: Process entity types (using existing properties service)
+    processEntityTypes(stg1Sheet, CustomLogger);
+    
+    // Step 6: Update Main Ingest sheet with completion status
+    updateMainIngestStatus(currentMonth, CustomLogger);
+    
+    CustomLogger.add("Additional processing completed successfully");
+    
+    // Show success message to user
+    SpreadsheetApp.getUi().alert(
+      'Stage 2 Completed',
+      'Additional data processing for ' + currentMonth + ' has been successfully completed on the ' + stg1SheetName + ' tab.',
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+    
+  } catch (error) {
+    CustomLogger.add("ERROR in performAdditionalProcessing: " + error.toString());
+    
+    // Show error message
+    SpreadsheetApp.getUi().alert(
+      'Error',
+      'An error occurred during additional processing:\n' + error.toString() + '\n\nExecution Log:\n' + CustomLogger.getLogs(),
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+  }
+}
+
+/**
+ * Trims whitespace from all cells in column A
+ * @param {Sheet} sheet - The sheet to process
+ * @param {Object} logger - The logger object
+ */
+function trimWhitespaceColumnA(sheet, logger) {
+  logger.add("Starting whitespace trimming for column A");
+  
+  // Get last row with data
+  const lastRow = sheet.getLastRow();
+  logger.add("Last row with data: " + lastRow);
+  
+  // Skip header row (row 1)
+  if (lastRow > 1) {
+    // Get all values from column A (starting from A2)
+    const dataRange = sheet.getRange("A2:A" + lastRow);
+    const values = dataRange.getValues();
+    
+    // Track how many cells were trimmed
+    let trimmedCount = 0;
+    
+    // Process each cell
+    for (let i = 0; i < values.length; i++) {
+      // Get current value
+      const currentValue = values[i][0];
+      
+      // Skip empty or non-string values
+      if (!currentValue || typeof currentValue !== 'string') continue;
+      
+      // Trim the value
+      const trimmedValue = currentValue.trim();
+      
+      // If the value changed after trimming, update it
+      if (trimmedValue !== currentValue) {
+        // Row index is i+2 because we're starting from row 2
+        sheet.getRange(i + 2, 1).setValue(trimmedValue);
+        trimmedCount++;
+      }
+    }
+    
+    logger.add("Trimmed whitespace from " + trimmedCount + " cells in column A");
+  }
+  
+  logger.add("Completed whitespace trimming for column A");
+}
+
+/**
+ * Performs name substitution based on Data Source tab
+ * @param {Sheet} sheet - The sheet to process
+ * @param {Object} logger - The logger object
+ */
+function performNameSubstitution(sheet, logger) {
+  try {
+    logger.add("Starting name substitution process for column A");
+    
+    // Get the Data Source sheet
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const dataSourceSheet = ss.getSheetByName("Data Source");
+    
+    if (!dataSourceSheet) {
+      throw new Error("Data Source sheet not found");
+    }
+    
+    // Get substitution data (I2:J200)
+    const substitutionRange = dataSourceSheet.getRange("I2:J200");
+    logger.add("Reading substitution data from Data Source I2:J200");
+    const substitutionData = substitutionRange.getValues();
+    
+    // Create substitution map
+    const substitutionMap = {};
+    let substitutionCount = 0;
+    
+    // Build the map of old values to new values
+    for (let i = 0; i < substitutionData.length; i++) {
+      const oldValue = substitutionData[i][0]; // Column I
+      const newValue = substitutionData[i][1]; // Column J
+      
+      if (oldValue && newValue) {
+        // Convert to string and trim whitespace
+        const oldValueStr = String(oldValue).trim();
+        substitutionMap[oldValueStr] = newValue;
+        substitutionCount++;
+      }
+    }
+    
+    logger.add("Loaded " + substitutionCount + " substitution mappings");
+    
+    if (substitutionCount === 0) {
+      logger.add("No substitution mappings found, skipping substitution");
+      return;
+    }
+    
+    // Get last row with data
+    const lastRow = sheet.getLastRow();
+    
+    // Get all values from column A (A2:A200)
+    const columnRange = sheet.getRange("A2:A" + Math.min(lastRow, 200));
+    const columnValues = columnRange.getValues();
+    logger.add("Reading values from column A");
+    
+    // Track changes
+    let changedCount = 0;
+    const changes = [];
+    
+    // Check and replace values
+    for (let i = 0; i < columnValues.length; i++) {
+      if (!columnValues[i][0]) continue; // Skip empty cells
+      
+      const currentValue = String(columnValues[i][0]).trim();
+      const rowNum = i + 2; // +2 because we start at row 2
+      
+      // Check if current value needs substitution
+      if (substitutionMap[currentValue] !== undefined) {
+        const newValue = substitutionMap[currentValue];
+        
+        // Replace value in the sheet
+        sheet.getRange(rowNum, 1).setValue(newValue);
+        logger.add("Replacing in A" + rowNum + ": \"" + currentValue + "\" with \"" + newValue + "\"");
+        
+        // Track change
+        changes.push({
+          row: rowNum,
+          oldValue: currentValue,
+          newValue: newValue
+        });
+        
+        changedCount++;
+      }
+    }
+    
+    // Force the spreadsheet to update
+    SpreadsheetApp.flush();
+    
+    if (changedCount > 0) {
+      logger.add("Substituted " + changedCount + " values");
+      logger.add("Applied all substitutions and flushed changes");
+      
+      // Create a summary for the user
+      let summary = "Performed " + changedCount + " substitutions in column A:\n\n";
+      changes.forEach(change => {
+        summary += "Row " + change.row + ": \"" + change.oldValue + "\" → \"" + change.newValue + "\"\n";
+      });
+      
+      // If there are too many changes, truncate the summary
+      if (changes.length > 10) {
+        const truncatedSummary = summary.split('\n').slice(0, 12).join('\n');
+        summary = truncatedSummary + "\n\n(+" + (changes.length - 10) + " more substitutions)";
+      }
+      
+      // Log the substitution summary
+      logger.add(summary);
+    } else {
+      logger.add("No values needed substitution");
+    }
+    
+  } catch (error) {
+    logger.add("ERROR in performNameSubstitution: " + error.toString());
+    throw error;
+  }
+}
+
+/**
+ * Insert a new column for entity types
+ * @param {Sheet} sheet - The sheet to process
+ * @param {Object} logger - The logger object
+ */
+function insertEntityTypeColumn(sheet, logger) {
+  try {
+    logger.add("Inserting column for entity types before column A");
+    
+    // Insert column before A
+    sheet.insertColumnBefore(1);
+    
+    // Add header for entity type column
+    sheet.getRange("A1").setValue("Entity Type");
+    sheet.getRange("A1").setFontWeight("bold");
+    
+    logger.add("Added entity type column");
+    
+  } catch (error) {
+    logger.add("ERROR in insertEntityTypeColumn: " + error.toString());
+    throw error;
+  }
+}
+
+/**
+ * Process entity types for all club names with improved logging and verification
+ * @param {Sheet} sheet - The sheet to process
+ * @param {Object} [logger] - Optional logger object
+ */
+function processEntityTypes(sheet, logger) {
+  // Create a fallback logger if none is provided
+  const log = logger || {
+    add: function(message) {
+      console.log(message);
+    }
+  };
+  
+  try {
+    log.add("Processing entity types for all clubs");
+    
+    // Get all club names from B2:B200 (column B since we inserted column A)
+    const clubRange = sheet.getRange("B2:B200");
+    const clubNames = clubRange.getValues();
+    
+    // Process each club name
+    let processedCount = 0;
+    let updateFailedCount = 0;
+    
+    for (let i = 0; i < clubNames.length; i++) {
+      const clubName = clubNames[i][0];
+      if (!clubName) continue;
+      
+      // Process club data and get entity type
+      const entityType = processClubData(clubName, log);
+      
+      // Set entity type in column A (i+2 because we start at row 2)
+      if (entityType) {
+        const rowIndex = i + 2;
+        try {
+          sheet.getRange(rowIndex, 1).setValue(entityType);
+          log.add(`Updated cell A${rowIndex} with entity type: ${entityType}`);
+          processedCount++;
+          
+          // Verify the update (optional but helpful for debugging)
+          const verifiedValue = sheet.getRange(rowIndex, 1).getValue();
+          if (verifiedValue !== entityType) {
+            log.add(`WARNING: Verification failed for A${rowIndex}. Expected: ${entityType}, Got: ${verifiedValue}`);
+            updateFailedCount++;
+          }
+        } catch (updateError) {
+          log.add(`ERROR updating cell A${rowIndex}: ${updateError}`);
+          updateFailedCount++;
+        }
+      }
+    }
+    
+    // Force the spreadsheet to save changes
+    SpreadsheetApp.flush();
+    
+    log.add(`Successfully processed ${processedCount} clubs (${updateFailedCount} update failures)`);
+    
+  } catch (error) {
+    log.add("ERROR in processEntityTypes: " + error.toString());
+    throw error;
+  }
+}
+
+/**
+ * Process club data to determine entity type
+ * @param {string} clubName - The club name to process
+ * @param {Object} [logger] - Optional logger object
+ * @returns {string|null} Entity type or null
+ */
+function processClubData(clubName, logger) {
+  // Create a fallback logger if none is provided
+  const log = logger || {
+    add: function(message) {
+      console.log(message);
+    }
+  };
+
+  // Get entity type from the service with partial matching
+  const entityTypeResult = getEntityTypePartialET(clubName);
+  
+  if (typeof entityTypeResult === 'string') {
+    // Single match found
+    log.add(`${clubName} has entity type: ${entityTypeResult}`);
+    return entityTypeResult;
+  } else if (entityTypeResult && typeof entityTypeResult === 'object') {
+    // Multiple matches found - log them and use the first one
+    const keys = Object.keys(entityTypeResult);
+    log.add(`${clubName} has multiple matches: ${keys.join(', ')}`);
+    
+    // Using the first match
+    return entityTypeResult[keys[0]];
+  } else {
+    // No entity type found for this club
+    log.add(`No entity type found for ${clubName}`);
+    return null;
+  }
+}
+
+/**
+ * Updates the Main Ingest sheet to indicate Stage 2 is complete
+ * @param {string} currentMonth - The month identifier (e.g., "Feb-25")
+ * @param {Object} logger - The logger object
+ */
+function updateMainIngestStatus(currentMonth, logger) {
+  // Skip if we couldn't detect the month
+  if (!currentMonth) {
+    logger.add("WARNING: Cannot update Main Ingest status without month information");
+    return;
+  }
+  
+  try {
+    logger.add("Updating Main Ingest sheet for month: " + currentMonth);
+    
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const mainIngestSheet = ss.getSheetByName("Main Ingest");
+    
+    if (!mainIngestSheet) {
+      logger.add("WARNING: Main Ingest sheet not found");
+      return;
+    }
+    
+    // Get range E2:E30 to find the month
+    const monthRange = mainIngestSheet.getRange("E2:E30");
+    const monthValues = monthRange.getValues();
+    
+    let rowFound = -1;
+    
+    // Search for the month in the range
+    for (let i = 0; i < monthValues.length; i++) {
+      let cellValue = monthValues[i][0];
+      
+      // Skip empty cells
+      if (!cellValue) continue;
+      
+      // If cell contains a Date object, format it to match our search string
+      if (cellValue instanceof Date) {
+        cellValue = Utilities.formatDate(cellValue, Session.getScriptTimeZone(), "MMM-yy");
+      } else {
+        // Otherwise trim any spaces if it's a string
+        cellValue = cellValue.toString().trim();
+      }
+      
+      // Compare with the current month
+      if (cellValue === currentMonth) {
+        rowFound = i + 2; // +2 because range starts at row 2
+        break;
+      }
+    }
+    
+    if (rowFound > 0) {
+      // Update column E with completion status
+      mainIngestSheet.getRange("F" + rowFound).setValue(currentMonth + " (Stage 2 Completed)");
+      logger.add("Updated Main Ingest sheet at row " + rowFound + " with Stage 2 completion status");
+      
+      // Force the spreadsheet to update
+      SpreadsheetApp.flush();
+    } else {
+      logger.add("WARNING: Could not find month " + currentMonth + " in Main Ingest sheet");
+    }
+    
+  } catch (error) {
+    logger.add("ERROR in updateMainIngestStatus: " + error.toString());
+    // Continue with processing even if this fails
+  }
+}
+
+/**
+ * Add a menu item to run the additional processing
+ */
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Processing Tools')
+    .addItem('Run Additional Processing', 'performAdditionalProcessing')
+    .addToUi();
+}
