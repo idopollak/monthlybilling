@@ -1,0 +1,339 @@
+/**
+ * Ingest4 - Combined script for billing date calculation and XLS import
+ * 
+ * This script combines functionality from getFirstDayPreviousMonth.js and TD_XLSimport2.js
+ * to automate the process of:
+ * 1. Identifying the current billing month (first day of previous month)
+ * 2. Locating this date in column E2:E30 and verifying with checkbox in column D
+ * 3. Presenting a UI for the user to confirm billing month and provide XLS URL
+ * 4. Importing the XLS file into a new tab named "[month-yy] (RAW)"
+ */
+
+// Custom logger utility for tracking script execution
+const CustomLogger = {
+  logs: [],
+  add: function(message) {
+    this.logs.push(new Date().toISOString() + ": " + message);
+    console.log(message);
+    // We'll handle console logging instead of using Logger
+  },
+  getLogs: function() {
+    return this.logs.join("\n");
+  }
+};
+
+/**
+ * Main function that initiates the ingest process
+ */
+function runIngest4() {
+  CustomLogger.add("Starting Ingest4 process");
+  
+  try {
+    // Step 1: Calculate first day of previous month
+    const dateInfo = getFirstDayPreviousMonth();
+    CustomLogger.add("Retrieved previous month date: " + dateInfo.firstDayPreMonthShort);
+    
+    // Step 2: Find this date in column E2:E30
+    const billingMonthInfo = findBillingMonth(dateInfo.firstDayPreMonthShort);
+    if (!billingMonthInfo) {
+      throw new Error("Could not find billing month " + dateInfo.firstDayPreMonthShort + " in column E2:E30");
+    }
+    
+    // Step 3: Display HTML UI for confirmation and URL input
+    showIngestDialog(billingMonthInfo);
+    
+    // Note: The actual import will be triggered from the HTML UI via callback
+  } catch (error) {
+    CustomLogger.add("ERROR: " + error.toString());
+    
+    // Show error message with logs
+    const ui = SpreadsheetApp.getUi();
+    ui.alert(
+      'Error',
+      'Error occurred:\n' + error.toString() + '\n\nExecution Log:\n' + CustomLogger.getLogs(),
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+/**
+ * Gets the first day of the previous month in different formats
+ * @return {Object} Object containing the formatted dates
+ */
+function getFirstDayPreviousMonth() {
+  CustomLogger.add("Calculating first day of previous month");
+  
+  // Get today's date
+  const today = new Date();
+  
+  // Create a date for the first day of the current month
+  const firstDayCurrentMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+  
+  // Go back one month for first day of previous month (direct calculation)
+  const firstDayPrevMonth = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+  
+  // Store it as a constant
+  const firstDayPreMonth = firstDayPrevMonth;
+  
+  // Format as dd/mm/yyyy
+  const firstDayPreMonthFull = Utilities.formatDate(firstDayPreMonth, Session.getScriptTimeZone(), "dd/MM/yyyy");
+  
+  // Format as "MMM-yy"
+  const firstDayPreMonthShort = Utilities.formatDate(firstDayPreMonth, Session.getScriptTimeZone(), "MMM-yy");
+  
+  CustomLogger.add("First day of previous month (short format): " + firstDayPreMonthShort);
+  
+  // Return all values for further processing
+  return {
+    today: today,
+    firstDayPreMonth: firstDayPreMonth,
+    firstDayPreMonthFull: firstDayPreMonthFull,
+    firstDayPreMonthShort: firstDayPreMonthShort
+  };
+}
+
+/**
+ * Searches for the billing month in column E2:E30 and checks if it's selected in column D
+ * @param {string} billingMonthShort - Billing month in short format (e.g., "Mar-24")
+ * @return {Object|null} Object with row info or null if not found
+ */
+function findBillingMonth(billingMonthShort) {
+  CustomLogger.add("Searching for billing month: " + billingMonthShort + " in column E2:E30");
+  
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Main Ingest");
+  
+  if (!sheet) {
+    CustomLogger.add("ERROR: Main Ingest sheet not found");
+    throw new Error("Main Ingest sheet not found");
+  }
+  
+  // Get range E2:E30
+  const monthRange = sheet.getRange("E2:E30");
+  const monthValues = monthRange.getValues();
+  
+  // Get range D2:D30 for checkboxes
+  const checkboxRange = sheet.getRange("D2:D30");
+  const checkboxValues = checkboxRange.getValues();
+  
+  // Search for the month in the range
+  for (let i = 0; i < monthValues.length; i++) {
+    let cellValue = monthValues[i][0];
+    
+    // Skip empty cells
+    if (!cellValue) continue;
+    
+    // If cell contains a Date object, format it to match our search string
+    if (cellValue instanceof Date) {
+      cellValue = Utilities.formatDate(cellValue, Session.getScriptTimeZone(), "MMM-yy");
+    } else {
+      // Otherwise trim any spaces if it's a string
+      cellValue = cellValue.toString().trim();
+    }
+    
+    // Now compare the formatted/cleaned values
+    if (cellValue === billingMonthShort) {
+      CustomLogger.add("Found billing month at row: " + (i + 2));
+      
+      return {
+        row: i + 2,
+        billingMonth: billingMonthShort,
+        isSelected: checkboxValues[i][0] === true,
+        sheetName: "Main Ingest"  // Store the sheet name for later use
+      };
+    }
+  }
+  
+  CustomLogger.add("Billing month not found in range");
+  return null;
+}
+
+/**
+ * Shows the HTML dialog for user confirmation and URL input
+ * @param {Object} billingMonthInfo - Information about the found billing month
+ */
+function showIngestDialog(billingMonthInfo) {
+  CustomLogger.add("Displaying ingest dialog for billing month: " + billingMonthInfo.billingMonth);
+  
+  // Store billing month info in script properties temporarily
+  // This is a workaround to pass data to the HTML
+  PropertiesService.getScriptProperties().setProperty(
+    'currentBillingMonthInfo', 
+    JSON.stringify(billingMonthInfo)
+  );
+  
+  const ui = SpreadsheetApp.getUi();
+  const html = HtmlService.createHtmlOutputFromFile('ingestv4')
+      .setWidth(400)
+      .setHeight(300);
+  
+  // Show the dialog
+  ui.showModalDialog(html, 'Import XLS File for ' + billingMonthInfo.billingMonth);
+}
+
+/**
+ * Function to retrieve billing month info for the UI
+ * This is called from the HTML side
+ */
+function getBillingMonthInfo() {
+  try {
+    // Retrieve from script properties
+    const storedInfo = PropertiesService.getScriptProperties().getProperty('currentBillingMonthInfo');
+    if (storedInfo) {
+      return JSON.parse(storedInfo);
+    }
+    
+    // If not found in properties, recalculate
+    const dateInfo = getFirstDayPreviousMonth();
+    const billingMonthInfo = findBillingMonth(dateInfo.firstDayPreMonthShort);
+    
+    return billingMonthInfo || {
+      billingMonth: dateInfo.firstDayPreMonthShort,
+      isSelected: false,
+      row: null,
+      sheetName: "Main Ingest"
+    };
+  } catch (error) {
+    console.error("Error getting billing month info:", error);
+    return {
+      billingMonth: "[Error retrieving billing month]",
+      isSelected: false,
+      row: null,
+      sheetName: "Main Ingest"
+    };
+  }
+}
+
+/**
+ * Callback function triggered from the HTML UI to import the XLS file
+ * @param {Object} formData - Form data with billing month and URL
+ * @return {Object} Result of the import operation
+ */
+function importXLSFile(formData) {
+  CustomLogger.add("Starting XLS import with form data: " + JSON.stringify(formData));
+  
+  try {
+    // Validate form data
+    if (!formData.billingMonth) {
+      throw new Error("Billing month not specified");
+    }
+    
+    if (!formData.confirmedBillingMonth) {
+      throw new Error("Billing month not confirmed");
+    }
+    
+    if (!formData.xlsUrl) {
+      throw new Error("XLS URL not provided");
+    }
+    
+    // Set the tab name
+    const newTabName = formData.billingMonth + " (RAW)";
+    CustomLogger.add("New tab name will be: " + newTabName);
+    
+    // Get active spreadsheet
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    
+    // Extract file ID from URL
+    const fileId = formData.xlsUrl.match(/[-\w]{25,}/);
+    if (!fileId) {
+      throw new Error("Invalid Google Drive URL");
+    }
+    CustomLogger.add("Extracted file ID: " + fileId[0]);
+
+    // Get the source file from Drive
+    const sourceFile = DriveApp.getFileById(fileId[0]);
+    CustomLogger.add("Retrieved source file: " + sourceFile.getName());
+
+    // Create a copy with conversion
+    const blob = sourceFile.getBlob();
+    const tempFile = {
+      name: "TempFile_" + new Date().getTime() + ".xlsx",
+      mimeType: MimeType.GOOGLE_SHEETS,
+      parents: [{id: DriveApp.getRootFolder().getId()}]
+    };
+    
+    const file = Drive.Files.create(tempFile, blob, { convert: true });
+    CustomLogger.add("Created and converted temporary file: " + file.name);
+
+    // Open the converted sheet
+    const convertedSheet = SpreadsheetApp.openById(file.id);
+    CustomLogger.add("Opened converted spreadsheet");
+
+    // Get the first sheet of the converted file
+    const sourceSheet = convertedSheet.getSheets()[0];
+    CustomLogger.add("Accessing first sheet: " + sourceSheet.getName());
+
+    // Get all data from the source sheet
+    const sourceData = sourceSheet.getDataRange().getValues();
+    CustomLogger.add("Retrieved data from source sheet. Rows: " + sourceData.length);
+
+    // Create new sheet in target spreadsheet or use existing
+    let newSheet;
+    try {
+      newSheet = ss.insertSheet(newTabName);
+      CustomLogger.add("Created new sheet: " + newTabName);
+    } catch (e) {
+      // If sheet exists, get reference and clear it
+      newSheet = ss.getSheetByName(newTabName);
+      newSheet.clear();
+      CustomLogger.add("Cleared existing sheet: " + newTabName);
+    }
+
+    // Copy data to new sheet
+    if (sourceData.length > 0) {
+      newSheet.getRange(1, 1, sourceData.length, sourceData[0].length)
+              .setValues(sourceData);
+      CustomLogger.add("Copied data to new sheet");
+    }
+
+    // Clean up temporary file
+    Drive.Files.remove(file.id);
+    CustomLogger.add("Cleaned up temporary files");
+    
+    // Get the Main Ingest sheet where the checkbox is located
+    const mainIngestSheet = ss.getSheetByName("Main Ingest");
+    
+    if (mainIngestSheet) {
+      // Always set the checkbox to true regardless of its current state
+      mainIngestSheet.getRange("D" + formData.row).setValue(true);
+      CustomLogger.add("Updated checkbox in cell D" + formData.row + " to TRUE");
+      
+      // Add "Import Completed" text to column F in the same row (not E)
+      mainIngestSheet.getRange("F" + formData.row).setValue(formData.billingMonth + " (Import Completed)");
+      CustomLogger.add("Added completion text to cell F" + formData.row);
+      
+      // Force the spreadsheet to update
+      SpreadsheetApp.flush();
+    } else {
+      CustomLogger.add("WARNING: Could not find 'Main Ingest' sheet to update checkbox and status");
+    }
+    
+    // Log successful completion
+    CustomLogger.add("Import completed successfully");
+    
+    return {
+      success: true,
+      message: "Data has been successfully imported to new tab \"" + newTabName + "\"",
+      logs: CustomLogger.getLogs()
+    };
+    
+  } catch (error) {
+    CustomLogger.add("ERROR during import: " + error.toString());
+    
+    return {
+      success: false,
+      message: "An error occurred: " + error.toString(),
+      logs: CustomLogger.getLogs()
+    };
+  }
+}
+
+/**
+ * Adds a menu to the spreadsheet UI when the document is opened
+ */
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Ingest Tools')
+    .addItem('Import XLS for Billing Month', 'runIngest4')
+    .addToUi();
+}
